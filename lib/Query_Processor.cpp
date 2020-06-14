@@ -1,6 +1,7 @@
 #include <iostream>     // std::cout
 #include <algorithm>    // std::sort
 #include <vector>       // std::vector
+#include <map> //DAVID
 #include "re2/re2.h"
 #include "re2/regexp.h"
 #include "proxysql.h"
@@ -28,6 +29,14 @@
 #include <thread>
 #include <future>
 extern MySQL_Threads_Handler *GloMTH;
+
+/*static int qprule_cmp(const QP_rule_t *a, const QP_rule_t *b) {
+        const unsigned long long *ia = (const unsigned long long *)&(((QP_rule_t *)a)->rule_id);
+        const unsigned long long *ib = (const unsigned long long *)&(((QP_rule_t *)b)->rule_id);
+        if (*ia < *ib) return -1;
+        if (*ia > *ib) return 1;
+        return 0;
+}*/
 
 static int int_cmp(const void *a, const void *b) {
 	const unsigned long long *ia = (const unsigned long long *)a;
@@ -412,9 +421,23 @@ static void __reset_rules(std::vector<QP_rule_t *> * qrs) {
 	qrs->clear();
 }
 
+
+static void __reset_rules(std::map<long long,std::vector<QP_rule_t *>*> * qrsm) {
+        proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 5, "Resetting rules in Query Processor Mapped table %p\n", qrs);
+        if (qrsm==NULL) return;
+        std::vector<QP_rule_t *>* qrs;
+        for (std::map<long long,std::vector<QP_rule_t *>*>::iterator it=qrsm->begin(); it!=qrsm->end(); ++it) {
+                qrs=it->second;
+                __reset_rules(qrs);
+        }
+        qrsm->clear();
+}
+
 // per thread variables
 __thread unsigned int _thr_SQP_version;
 __thread std::vector<QP_rule_t *> * _thr_SQP_rules;
+//__thread std::set<QP_rule_t *> * _thr_SQP_S_rules;
+__thread std::map<long long, std::vector<QP_rule_t *>*> * _thr_SQP_M_rules;
 __thread khash_t(khStrInt) * _thr_SQP_rules_fast_routing;
 __thread char * _thr___rules_fast_routing___keys_values;
 __thread Command_Counter * _thr_commands_counters[MYSQL_COM_QUERY___NONE];
@@ -518,12 +541,12 @@ Query_Processor::Query_Processor() {
 	rules_fast_routing = kh_init(khStrInt); // create a hashtable
 	rules_fast_routing___keys_values = NULL;
 	rules_fast_routing___keys_values___size = 0;
-	new_req_conns_count = 0;
 };
 
 Query_Processor::~Query_Processor() {
 	for (int i=0; i<MYSQL_COM_QUERY___NONE; i++) delete commands_counters[i];
 	__reset_rules(&rules);
+	__reset_rules(&map_rules);
 	kh_destroy(khStrInt, rules_fast_routing);
 	if (rules_fast_routing___keys_values) {
 		free(rules_fast_routing___keys_values);
@@ -562,6 +585,7 @@ void Query_Processor::init_thread() {
 	proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Initializing Per-Thread Query Processor Table with version=0\n");
 	_thr_SQP_version=0;
 	_thr_SQP_rules=new std::vector<QP_rule_t *>;
+	_thr_SQP_M_rules=new std::map<long long, std::vector<QP_rule_t *>*>;
 	_thr_SQP_rules_fast_routing = kh_init(khStrInt); // create a hashtable
 	_thr___rules_fast_routing___keys_values = NULL;
 	for (int i=0; i<MYSQL_COM_QUERY___NONE; i++) _thr_commands_counters[i] = new Command_Counter(i);
@@ -571,6 +595,7 @@ void Query_Processor::init_thread() {
 void Query_Processor::end_thread() {
 	proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Destroying Per-Thread Query Processor Table with version=%d\n", _thr_SQP_version);
 	__reset_rules(_thr_SQP_rules);
+        __reset_rules(_thr_SQP_M_rules);
 	delete _thr_SQP_rules;
 	kh_destroy(khStrInt, _thr_SQP_rules_fast_routing);
 	if (_thr___rules_fast_routing___keys_values) {
@@ -598,10 +623,6 @@ unsigned long long Query_Processor::get_rules_mem_used() {
 	s = rules_mem_used;
 	wrunlock();
 	return s;
-}
-
-unsigned long long Query_Processor::get_new_req_conns_count() {
-	return __sync_fetch_and_add(&new_req_conns_count, 0);
 }
 
 QP_rule_t * Query_Processor::new_query_rule(int rule_id, bool active, char *username, char *schemaname, int flagIN, char *client_addr, char *proxy_addr, int proxy_port, char *digest, char *match_digest, char *match_pattern, bool negate_match_pattern, char *re_modifiers, int flagOUT, char *replace_pattern, int destination_hostgroup, int cache_ttl, int cache_empty_result, int cache_timeout , int reconnect, int timeout, int retries, int delay, int next_query_flagIN, int mirror_flagOUT, int mirror_hostgroup, char *error_msg, char *OK_msg, int sticky_conn, int multiplex, int gtid_from_hostgroup, int log, bool apply, char *comment) {
@@ -694,7 +715,7 @@ void Query_Processor::delete_query_rule(QP_rule_t *qr) {
 void Query_Processor::reset_all(bool lock) {
 	if (lock)
 		pthread_rwlock_wrlock(&rwlock);
-	__reset_rules(&rules);
+	__reset_rules(&rules); //DAVID review as map is not here
 	if (rules_fast_routing) {
 		kh_destroy(khStrInt, rules_fast_routing);
 		rules_fast_routing = NULL;
@@ -713,6 +734,7 @@ bool Query_Processor::insert(QP_rule_t *qr, bool lock) {
 	if (lock)
 		pthread_rwlock_wrlock(&rwlock);
 	rules.push_back(qr);
+	map_rules.find(qr->flagIN)->second->push_back(qr);
 	rules_mem_used += mem_used_rule(qr);
 	if (lock)
 		pthread_rwlock_unlock(&rwlock);
@@ -1296,6 +1318,120 @@ SQLite3_result * Query_Processor::get_query_digests_reset() {
 	return result;
 }
 
+void Query_Processor::update_query_rules(std::vector<QP_rule_t *> *qrv,std::vector<QP_rule_t *> *rules ){
+                __reset_rules(qrv);
+                QP_rule_t *qr1;
+                QP_rule_t *qr2;
+                for (std::vector<QP_rule_t *>::iterator it=rules->begin(); it!=rules->end(); ++it) {
+                        qr1=*it;
+                        if (qr1->active) {
+                                proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Copying Query Rule id: %d\n", qr1->rule_id);
+                                char buf[20];
+                                if (qr1->digest) { // not 0
+                                        sprintf(buf,"0x%016llX", (long long unsigned int)qr1->digest);
+                                }
+                                std::string re_mod;
+                                re_mod="";
+                                if ((qr1->re_modifiers & QP_RE_MOD_CASELESS) == QP_RE_MOD_CASELESS) re_mod = "CASELESS";
+                                if ((qr1->re_modifiers & QP_RE_MOD_GLOBAL) == QP_RE_MOD_GLOBAL) {
+                                        if (re_mod.length()) {
+                                                re_mod = re_mod + ",";
+                                        }
+                                        re_mod = re_mod + "GLOBAL";
+                                }
+                                qr2=new_query_rule(qr1->rule_id, qr1->active, qr1->username, qr1->schemaname, qr1->flagIN,
+                                        qr1->client_addr, qr1->proxy_addr, qr1->proxy_port,
+                                        ( qr1->digest ? buf : NULL ) ,
+                                        qr1->match_digest, qr1->match_pattern, qr1->negate_match_pattern, (char *)re_mod.c_str(),
+                                        qr1->flagOUT, qr1->replace_pattern, qr1->destination_hostgroup,
+                                        qr1->cache_ttl, qr1->cache_empty_result, qr1->cache_timeout,
+                                        qr1->reconnect, qr1->timeout, qr1->retries, qr1->delay,
+                                        qr1->next_query_flagIN, qr1->mirror_flagOUT, qr1->mirror_hostgroup,
+                                        qr1->error_msg, qr1->OK_msg, qr1->sticky_conn, qr1->multiplex,
+                                        qr1->gtid_from_hostgroup,
+                                        qr1->log, qr1->apply,
+                                        qr1->comment);
+                                qr2->parent=qr1;        // pointer to parent to speed up parent update (hits)
+                                if (qr2->match_digest) {
+                                        proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Compiling regex for rule_id: %d, match_digest: \n", qr2->rule_id, qr2->match_digest);
+                                        qr2->regex_engine1=(void *)compile_query_rule(qr2,1);
+                                }
+                                if (qr2->match_pattern) {
+                                        proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Compiling regex for rule_id: %d, match_pattern: \n", qr2->rule_id, qr2->match_pattern);
+                                        qr2->regex_engine2=(void *)compile_query_rule(qr2,2);
+                                }
+                                qrv->push_back(qr2);
+                        }
+		}
+}
+
+void Query_Processor::update_mapped_query_rules(std::map<long long,std::vector<QP_rule_t *>*> *qrm, std::vector<QP_rule_t *> *rules ){
+                __reset_rules(qrm);
+//                __reset_rules(_thr_SQP_M_rules);
+//                for (std::map<long long, std::vector<QP_rule_t *>>::iterator it=map_rules->begin(); it!=map_rules->end(); ++it) {
+//			update_query_rules(qrm->find(it->first)->second,it->second);
+//
+//	}
+                QP_rule_t *qr1;
+                QP_rule_t *qr2;
+                for (std::vector<QP_rule_t *>::iterator it=rules->begin(); it!=rules->end(); ++it) {
+                        qr1=*it;
+                        if (qr1->active) {
+                                proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Copying Query Rule id: %d\n", qr1->rule_id);
+                                char buf[20];
+                                if (qr1->digest) { // not 0
+                                        sprintf(buf,"0x%016llX", (long long unsigned int)qr1->digest);
+                                }
+                                std::string re_mod;
+                                re_mod="";
+                                if ((qr1->re_modifiers & QP_RE_MOD_CASELESS) == QP_RE_MOD_CASELESS) re_mod = "CASELESS";
+                                if ((qr1->re_modifiers & QP_RE_MOD_GLOBAL) == QP_RE_MOD_GLOBAL) {
+                                        if (re_mod.length()) {
+                                                re_mod = re_mod + ",";
+                                        }
+                                        re_mod = re_mod + "GLOBAL";
+                                }
+                                qr2=new_query_rule(qr1->rule_id, qr1->active, qr1->username, qr1->schemaname, qr1->flagIN,
+                                        qr1->client_addr, qr1->proxy_addr, qr1->proxy_port,
+                                        ( qr1->digest ? buf : NULL ) ,
+                                        qr1->match_digest, qr1->match_pattern, qr1->negate_match_pattern, (char *)re_mod.c_str(),
+                                        qr1->flagOUT, qr1->replace_pattern, qr1->destination_hostgroup,
+                                        qr1->cache_ttl, qr1->cache_empty_result, qr1->cache_timeout,
+                                        qr1->reconnect, qr1->timeout, qr1->retries, qr1->delay,
+                                        qr1->next_query_flagIN, qr1->mirror_flagOUT, qr1->mirror_hostgroup,
+                                        qr1->error_msg, qr1->OK_msg, qr1->sticky_conn, qr1->multiplex,
+                                        qr1->gtid_from_hostgroup,
+                                        qr1->log, qr1->apply,
+                                        qr1->comment);
+                                qr2->parent=qr1;        // pointer to parent to speed up parent update (hits)
+                                if (qr2->match_digest) {
+                                        proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Compiling regex for rule_id: %d, match_digest: \n", qr2->rule_id, qr2->match_digest);
+                                        qr2->regex_engine1=(void *)compile_query_rule(qr2,1);
+                                }
+                                if (qr2->match_pattern) {
+                                        proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Compiling regex for rule_id: %d, match_pattern: \n", qr2->rule_id, qr2->match_pattern);
+                                        qr2->regex_engine2=(void *)compile_query_rule(qr2,2);
+                                }
+				std::map<long long,std::vector<QP_rule_t *>*>::iterator it2;
+				it2=qrm->find(qr2->flagIN);
+				if (it2 == qrm->end()){
+					std::vector<QP_rule_t *> *rv=new std::vector<QP_rule_t *>;
+					qrm->insert(std::pair<long long,std::vector<QP_rule_t *>*> (qr2->flagIN,rv));
+				}
+				it2=qrm->find(qr2->flagIN);
+				it2->second->push_back(qr2);
+                        }
+                }
+
+/*                for (std::map<long long, std::vector<QP_rule_t *>*>::iterator it=qrm->begin(); it!=qrm->end(); ++it) {
+			std::vector<QP_rule_t *> *vr = it->second;
+			proxy_info("\n%d :",it->first);
+			for (std::vector<QP_rule_t *>::iterator it2=vr->begin(); it2!=vr->end(); ++it2) {
+				proxy_info("%d,",(*it2)->rule_id);
+			}
+		}
+*/
+}
 
 
 Query_Processor_Output * Query_Processor::process_mysql_query(MySQL_Session *sess, void *ptr, unsigned int size, Query_Info *qi) {
@@ -1322,8 +1458,11 @@ Query_Processor_Output * Query_Processor::process_mysql_query(MySQL_Session *ses
 		proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Detected a changed in version. Global:%d , local:%d . Refreshing...\n", version, _thr_SQP_version);
 		pthread_rwlock_rdlock(&rwlock);
 		_thr_SQP_version=__sync_add_and_fetch(&version,0);
-		__reset_rules(_thr_SQP_rules);
-		QP_rule_t *qr1;
+//		__reset_rules(_thr_SQP_rules);
+//                __reset_rules(_thr_SQP_M_rules);
+		update_query_rules(_thr_SQP_rules,&rules);
+		update_mapped_query_rules(_thr_SQP_M_rules,_thr_SQP_rules);
+/*		QP_rule_t *qr1;
 		QP_rule_t *qr2;
 		for (std::vector<QP_rule_t *>::iterator it=rules.begin(); it!=rules.end(); ++it) {
 			qr1=*it;
@@ -1365,7 +1504,7 @@ Query_Processor_Output * Query_Processor::process_mysql_query(MySQL_Session *ses
 				}
 				_thr_SQP_rules->push_back(qr2);
 			}
-		}
+		}*/
 		kh_destroy(khStrInt, _thr_SQP_rules_fast_routing);
 		_thr_SQP_rules_fast_routing = kh_init(khStrInt); // create a hashtable
 		if (_thr___rules_fast_routing___keys_values) {
@@ -1398,6 +1537,8 @@ Query_Processor_Output * Query_Processor::process_mysql_query(MySQL_Session *ses
 		flagIN=sess->next_query_flagIN;
 	}
 	int reiterate=mysql_thread___query_processor_iterations;
+        std::vector<QP_rule_t *>::iterator it=_thr_SQP_M_rules->find(flagIN)->second->begin();
+	it--;
 	if (sess->mirror==true) {
 		// we are into a mirror session
 		// we immediately set a destination_hostgroup
@@ -1412,9 +1553,17 @@ Query_Processor_Output * Query_Processor::process_mysql_query(MySQL_Session *ses
 			goto __exit_process_mysql_query;
 		}
 	}
+
+//__internal_loop:
+//	for (std::vector<QP_rule_t *>::iterator it=_thr_SQP_rules->begin(); it!=_thr_SQP_rules->end(); ++it) { 
+
+//      for (std::vector<QP_rule_t *>::iterator it=_thr_SQP_M_rules->find(flagIN)->second->begin(); it!=_thr_SQP_M_rules->find(flagIN)->second->end(); ++it) {
 __internal_loop:
-	for (std::vector<QP_rule_t *>::iterator it=_thr_SQP_rules->begin(); it!=_thr_SQP_rules->end(); ++it) {
+	while (it!=_thr_SQP_M_rules->find(flagIN)->second->end()){
+		it++;
+		if (it==_thr_SQP_M_rules->find(flagIN)->second->end()) continue;
 		qr=*it;
+                proxy_info("Executing rule_id: %d and flag_id: %d flag_out: %d \n",qr->rule_id,qr->flagIN,qr->flagOUT);
 		if (qr->flagIN != flagIN) {
 			proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 6, "query rule %d has no matching flagIN\n", qr->rule_id);
 			continue;
@@ -1522,7 +1671,7 @@ __internal_loop:
 				continue;
 			}
 		}
-
+//                proxy_info("B Executing in flagIN: %d\n",flagIN);
 		// if we arrived here, we have a match
 		qr->hits++; // this is done without atomic function because it updates only the local variables
 		bool set_flagOUT=false;
@@ -1648,6 +1797,8 @@ __internal_loop:
 				reiterate--;
 				goto __internal_loop;
 			}
+			it=_thr_SQP_M_rules->find(flagIN)->second->begin();
+			it--;
 		}
 	}
 
@@ -2475,12 +2626,6 @@ bool Query_Processor::query_parser_first_comment(Query_Processor_Output *qpo, ch
 					proxy_warning("Invalid gtid value=%s\n", value);
 				}
 			}
-			if (!strcasecmp(key, "create_new_connection")) {
-				int32_t val = atoi(value);
-				if (val == 1) {
-					qpo->create_new_conn = true;
-				}
-			}
 		}
 
 		proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 5, "Variables in comment %s , key=%s , value=%s\n", token, key, value);
@@ -2686,6 +2831,7 @@ void Query_Processor::load_fast_routing(SQLite3_result *resultset) {
 	unsigned long long tot_size = 0;
 	size_t rand_del_size = strlen(rand_del);
 	int num_rows = resultset->rows_count;
+	return;
 	if (num_rows) {
 		for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
 			SQLite3_row *r=*it;
